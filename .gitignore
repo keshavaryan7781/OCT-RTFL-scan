@@ -1,0 +1,40 @@
+cat << 'EOF' > .gitignore
+# Datasets & Heavy Raw Files
+duke_dataset/
+raw_data/
+*.zip
+*.tar.gz
+*.mat
+*.npy
+*.npz
+
+# Python & Environment
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.conda/
+
+# PyTorch Models & Checkpoints
+outputs/checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# Jupyter Notebooks & Visualizations
+.ipynb_checkpoints
+outputs/plots/
+
+# IDEs & System Files
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*.log
+pbs_jobs/*.log
+EOF
