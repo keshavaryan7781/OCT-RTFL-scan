@@ -1,40 +1,40 @@
-cat << 'EOF' > .gitignore
-# Datasets & Heavy Raw Files
-duke_dataset/
-raw_data/
-*.zip
-*.tar.gz
+# Original datasets and archives
+/duke_dataset/
+/raw_data/
 *.mat
-*.npy
-*.npz
+*.bmp
+*.BMP
+*.INT
+*.int
+*.zip
+*.tar
+*.tar.gz
 
-# Python & Environment
+# Generated data, predictions, and models
+/outputs/
+/nnUNet_raw/
+/nnUNet_preprocessed/
+/nnUNet_results/
+*.pth
+*.pt
+*.ckpt
+
+# Notebook and Python caches
+.ipynb_checkpoints/
 __pycache__/
 *.py[cod]
-*$py.class
-*.so
-.Python
-env/
+
+# Environments and credentials
+.venv/
 venv/
-ENV/
-.conda/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
 
-# PyTorch Models & Checkpoints
-outputs/checkpoints/
-*.pt
-*.pth
-*.ckpt
-*.onnx
-
-# Jupyter Notebooks & Visualizations
-.ipynb_checkpoints
-outputs/plots/
-
-# IDEs & System Files
-.vscode/
-.idea/
-.DS_Store
-*.swp
+# PBS logs and temporary files
+*.o[0-9]*
+*.e[0-9]*
 *.log
-pbs_jobs/*.log
-EOF
+.DS_Store
