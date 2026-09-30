@@ -1,0 +1,19 @@
+{
+  "seed": 42,
+  "train": [
+    "Subject_01",
+    "Subject_03",
+    "Subject_04",
+    "Subject_06",
+    "Subject_07",
+    "Subject_08"
+  ],
+  "val": [
+    "Subject_05",
+    "Subject_10"
+  ],
+  "test": [
+    "Subject_02",
+    "Subject_09"
+  ]
+}
