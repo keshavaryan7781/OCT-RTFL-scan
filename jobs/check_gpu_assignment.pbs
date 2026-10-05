@@ -1,0 +1,38 @@
+#!/bin/bash
+#PBS -N oct-gpu-map
+#PBS -q gpu
+#PBS -l select=1:ncpus=1:ngpus=1:mem=4gb
+#PBS -l walltime=00:05:00
+#PBS -j oe
+
+set -eo pipefail
+cd "${PBS_O_WORKDIR:?}"
+
+mkdir -p outputs/logs
+exec > "outputs/logs/gpu_map_${PBS_JOBID}.log" 2>&1
+
+hostname
+echo "Before conda: CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES-UNSET}"
+echo "PBS_GPUFILE=${PBS_GPUFILE-UNSET}"
+
+if [ -n "${PBS_GPUFILE:-}" ] && [ -r "$PBS_GPUFILE" ]; then
+    cat "$PBS_GPUFILE"
+fi
+
+qstat -f "$PBS_JOBID" || true
+nvidia-smi
+
+source "$HOME/miniconda3/etc/profile.d/conda.sh"
+conda activate oct_nfl
+
+echo "After conda: CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES-UNSET}"
+
+python - <<'PY'
+import torch
+
+print("CUDA available:", torch.cuda.is_available())
+print("Visible GPU count:", torch.cuda.device_count())
+
+for index in range(torch.cuda.device_count()):
+    print(f"Logical GPU {index}: {torch.cuda.get_device_name(index)}")
+PY

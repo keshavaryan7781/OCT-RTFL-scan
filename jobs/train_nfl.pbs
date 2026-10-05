@@ -1,0 +1,317 @@
+#!/bin/bash
+#PBS -N oct-nfl-train
+#PBS -q gpu
+#PBS -l select=1:ncpus=6:ngpus=1:mem=32gb
+#PBS -l place=scatter:shared
+#PBS -l walltime=12:00:00
+#PBS -j oe
+
+set -Ee -o pipefail
+
+# Prevent accidental execution on the login node.
+: "${PBS_JOBID:?Submit this script with qsub, not bash}"
+
+cd "$HOME/OCT-RTFL"
+mkdir -p outputs/logs
+
+log_file="$PWD/outputs/logs/train_${PBS_JOBID}.log"
+exec >> "$log_file" 2>&1
+
+# Preserve the original exit status and print GPU status on failure.
+on_exit() {
+    rc=$?
+    trap - EXIT
+
+    if [ "$rc" -ne 0 ]; then
+        echo "FAILED: exit=$rc; see preceding error. Log: $log_file"
+        nvidia-smi || true
+    fi
+
+    date
+    exit "$rc"
+}
+
+trap on_exit EXIT
+
+date
+hostname
+echo "PBS job: $PBS_JOBID"
+
+# Protect this project/fold from another copy of this script.
+# This does not reserve the GPU against other users.
+command -v flock >/dev/null
+exec 9> outputs/logs/Dataset501_fold0.lock
+
+if ! flock -n 9; then
+    echo "Another copy of this training script is running for fold 0."
+    exit 1
+fi
+
+# Preserve the incoming GPU mask across conda activation.
+mask_present="${CUDA_VISIBLE_DEVICES+x}"
+incoming_mask="${CUDA_VISIBLE_DEVICES-}"
+
+source "$HOME/miniconda3/etc/profile.d/conda.sh"
+conda activate oct_nfl
+
+set -u
+
+# All paths refer to our existing prepared dataset.
+export nnUNet_raw="$PWD/nnUNet_raw"
+export nnUNet_preprocessed="$PWD/nnUNet_preprocessed"
+export nnUNet_results="$PWD/nnUNet_results"
+
+# Keep CPU workers within the requested allocation.
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+
+export nnUNet_n_proc_DA=4
+export nnUNet_def_n_proc=2
+
+export nnUNet_compile=false
+export PYTHONUNBUFFERED=1
+export MPLBACKEND=Agg
+
+# Respect an incoming scheduler GPU mask.
+# Otherwise use the cluster template's manual-selection approach.
+if [ "$mask_present" = x ]; then
+    export CUDA_VISIBLE_DEVICES="$incoming_mask"
+else
+    # Restrict manual selection to the node we actually inspected.
+    if [ "$(hostname -s)" != rachel-gpu ] ||
+       [ -n "${PBS_GPUFILE:-}" ]; then
+        echo "Unrecognized GPU assignment; refusing a manual override."
+        exit 1
+    fi
+
+    # Physical GPU 1 was the idle GPU in the supplied diagnostic.
+    # Its current memory availability is checked below.
+    gpu_uuid="$(
+        nvidia-smi -i 1 --query-gpu=uuid --format=csv,noheader
+    )"
+
+    if [[ ! "$gpu_uuid" =~ ^GPU-[[:xdigit:]-]+$ ]]; then
+        echo "Could not resolve physical GPU 1 to a single UUID."
+        exit 1
+    fi
+
+    export CUDA_VISIBLE_DEVICES="$gpu_uuid"
+fi
+
+echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+nvidia-smi
+
+command -v python nnUNetv2_train
+python -m pip check
+
+# Validate the environment, saved split, labels, and GPU availability.
+python - <<'PY'
+import csv
+import json
+import os
+import sys
+from importlib.metadata import version
+from pathlib import Path
+
+import torch
+from nnunetv2.training.nnUNetTrainer.variants.training_length.nnUNetTrainer_Xepochs import (
+    nnUNetTrainer_250epochs,
+)
+
+
+def require(condition, message):
+    if not condition:
+        raise RuntimeError(message)
+
+
+root = Path.cwd()
+raw = Path(os.environ["nnUNet_raw"]) / "Dataset501_DukeNFL"
+prep = Path(os.environ["nnUNet_preprocessed"]) / "Dataset501_DukeNFL"
+
+print("Python:", sys.executable)
+print("PyTorch:", torch.__version__)
+print("nnU-Net:", version("nnunetv2"))
+
+require(
+    torch.__version__ == "2.5.1+cu121",
+    "PyTorch version changed.",
+)
+require(
+    version("nnunetv2") == "2.8.1",
+    "nnU-Net version changed.",
+)
+
+with (root / "outputs/audit/duke_manifest.csv").open() as handle:
+    rows = list(csv.DictReader(handle))
+
+subjects = json.loads(
+    (root / "configs/subject_split.json").read_text()
+)
+splits = json.loads(
+    (prep / "splits_final.json").read_text()
+)
+
+counts = {"train": 66, "val": 22, "test": 22}
+
+require(len(rows) == 110, "Expected 110 manifest cases.")
+require(
+    len({r["case_id"] for r in rows}) == 110,
+    "Duplicate case IDs.",
+)
+require(
+    {r["split"] for r in rows} == set(counts),
+    "Unexpected split names.",
+)
+require(len(splits) == 1, "Expected one custom fold.")
+
+all_subjects = [
+    subject
+    for partition in counts
+    for subject in subjects[partition]
+]
+
+require(
+    len(all_subjects) == len(set(all_subjects)) == 10,
+    "Subject split overlap or missing subjects.",
+)
+
+for partition, count in counts.items():
+    group = [
+        row for row in rows
+        if row["split"] == partition
+    ]
+
+    require(
+        len(group) == count,
+        f"Wrong {partition} case count.",
+    )
+    require(
+        {row["subject_id"] for row in group}
+        == set(subjects[partition]),
+        f"Wrong {partition} subjects.",
+    )
+
+    if partition != "test":
+        actual = splits[0][partition]
+        expected = {row["case_id"] for row in group}
+
+        require(
+            len(actual) == count and set(actual) == expected,
+            f"Fold {partition} differs from manifest.",
+        )
+
+for base in (raw, prep):
+    dataset = json.loads(
+        (base / "dataset.json").read_text()
+    )
+
+    require(
+        dataset["labels"]
+        == {"background": 0, "NFL": 1, "ignore": 2},
+        "Incorrect labels/ignore label.",
+    )
+    require(
+        dataset["numTraining"] == 88,
+        "Expected 88 development cases.",
+    )
+
+plans = json.loads(
+    (prep / "nnUNetPlans.json").read_text()
+)
+config = plans["configurations"]["2d"]
+prepared = prep / config["data_identifier"]
+
+require(
+    prepared.is_dir() and any(prepared.iterdir()),
+    "Preprocessed data missing.",
+)
+
+print("Verified: 66 train / 22 validation / 22 held-out test.")
+print("Patch:", config["patch_size"])
+print("Batch size:", config["batch_size"])
+
+require(torch.cuda.is_available(), "CUDA is unavailable.")
+require(
+    torch.cuda.device_count() == 1,
+    "Expected exactly one visible GPU.",
+)
+
+free, total = torch.cuda.mem_get_info(0)
+
+print("Selected GPU:", torch.cuda.get_device_name(0))
+print(
+    f"Free GPU memory: "
+    f"{free / 1024**3:.2f} / {total / 1024**3:.2f} GiB"
+)
+
+# Startup occupancy guard, not a model-memory estimate.
+require(
+    free >= 0.90 * total,
+    "GPU occupied: less than 90% VRAM free; "
+    "stopping before training.",
+)
+
+print("Preflight passed.")
+PY
+
+run_dir="$nnUNet_results/Dataset501_DukeNFL/nnUNetTrainer_250epochs__nnUNetPlans__2d/fold_0"
+
+train_args=(
+    501 2d 0
+    -tr nnUNetTrainer_250epochs
+    -p nnUNetPlans
+    -device cuda
+    -num_gpus 1
+    --val_best
+    --npz
+)
+
+# Choose fresh training, resume, or validation without deleting results.
+if [ -f "$run_dir/checkpoint_final.pth" ]; then
+
+    if [ ! -s "$run_dir/checkpoint_final.pth" ] ||
+       [ ! -s "$run_dir/checkpoint_best.pth" ]; then
+        echo "Final/best checkpoint missing or empty."
+        echo "Inspect checkpoints before continuing."
+        exit 1
+    fi
+
+    echo "Training already finished; validating the best checkpoint."
+    train_args+=(--val)
+
+elif [ -f "$run_dir/checkpoint_latest.pth" ] ||
+     [ -f "$run_dir/checkpoint_best.pth" ]; then
+
+    echo "Resuming from an existing checkpoint."
+    train_args+=(--c)
+
+elif [ -d "$run_dir" ]; then
+
+    shopt -s nullglob
+    unexpected=("$run_dir"/*.pth)
+
+    if [ "${#unexpected[@]}" -ne 0 ]; then
+        echo "Unrecognized checkpoint files found."
+        echo "Refusing to overwrite them."
+        exit 1
+    fi
+
+    backup="${run_dir}_failed_${PBS_JOBID}_$(date +%Y%m%d_%H%M%S)"
+
+    if [ -e "$backup" ]; then
+        echo "Backup path already exists: $backup"
+        exit 1
+    fi
+
+    mv -- "$run_dir" "$backup"
+    echo "Preserved checkpoint-free failed run: $backup"
+fi
+
+echo "Launching nnU-Net: ${train_args[*]}"
+
+nnUNetv2_train "${train_args[@]}"
+
+echo "SUCCESS: training/validation command completed."
+echo "Results: $run_dir"

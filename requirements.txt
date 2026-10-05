@@ -1,0 +1,19 @@
+# Segmentation
+nnunetv2==2.8.1
+
+# Arrays and MATLAB files
+numpy>=1.24
+scipy>=1.10
+h5py>=3.8
+
+# Images
+Pillow>=10.0
+scikit-image>=0.21
+
+# Plots and measurement export
+matplotlib>=3.7
+pandas>=2.0
+tqdm>=4.65
+
+# VS Code notebook kernel
+ipykernel>=6.25
