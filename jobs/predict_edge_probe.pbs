@@ -1,0 +1,278 @@
+#!/bin/bash
+#PBS -N oct-edge-probe
+#PBS -q gpu
+#PBS -l select=1:ncpus=6:ngpus=1:mem=16gb
+#PBS -l place=scatter:shared
+#PBS -l walltime=01:00:00
+#PBS -j oe
+
+set -Ee -o pipefail
+: "${PBS_JOBID:?Submit with qsub, not bash}"
+
+cd "$HOME/OCT-RTFL"
+mkdir -p outputs/logs
+
+log_file="$PWD/outputs/logs/edge_probe_${PBS_JOBID}.log"
+exec >> "$log_file" 2>&1
+
+on_exit() {
+    rc=$?
+    trap - EXIT
+
+    if [ "$rc" -ne 0 ]; then
+        echo "FAILED: exit=$rc; inspect the preceding error."
+        nvidia-smi || true
+    fi
+
+    date
+    exit "$rc"
+}
+trap on_exit EXIT
+
+date
+hostname
+
+# Coordinate with the existing training/test scripts.
+command -v flock >/dev/null
+exec 9> outputs/logs/Dataset501_fold0.lock
+
+if ! flock -n 9; then
+    echo "Another cooperating job holds the model's lock."
+    exit 1
+fi
+
+# Preserve any incoming scheduler GPU mask.
+mask_present="${CUDA_VISIBLE_DEVICES+x}"
+incoming_mask="${CUDA_VISIBLE_DEVICES-}"
+
+source "$HOME/miniconda3/etc/profile.d/conda.sh"
+conda activate oct_nfl
+set -u
+
+export nnUNet_raw="$PWD/nnUNet_raw"
+export nnUNet_preprocessed="$PWD/nnUNet_preprocessed"
+export nnUNet_results="$PWD/nnUNet_results"
+
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+export nnUNet_compile=false
+export PYTHONUNBUFFERED=1
+export MPLBACKEND=Agg
+
+if [ "$mask_present" = x ]; then
+    export CUDA_VISIBLE_DEVICES="$incoming_mask"
+else
+    if [ "$(hostname -s)" != rachel-gpu ] ||
+       [ -n "${PBS_GPUFILE:-}" ]; then
+        echo "Unrecognized GPU assignment; stopping."
+        exit 1
+    fi
+
+    gpu_uuid="$(
+        nvidia-smi -i 1 --query-gpu=uuid --format=csv,noheader
+    )"
+
+    if [[ ! "$gpu_uuid" =~ ^GPU-[[:xdigit:]-]+$ ]]; then
+        echo "Could not identify physical GPU 1."
+        exit 1
+    fi
+
+    export CUDA_VISIBLE_DEVICES="$gpu_uuid"
+fi
+
+echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+nvidia-smi
+
+export OCT_PILOT_OUTPUT="$PWD/outputs/target_edge_probe/predictions/$PBS_JOBID"
+
+python - <<'PY'
+import csv
+import hashlib
+import json
+import os
+from importlib.metadata import version
+from pathlib import Path
+
+import numpy as np
+import torch
+from PIL import Image
+
+
+def require(condition, message):
+    if not condition:
+        raise RuntimeError(message)
+
+
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+root = Path.cwd()
+pilot_root = root / "outputs/target_edge_probe"
+images = pilot_root / "images"
+output = Path(os.environ["OCT_PILOT_OUTPUT"])
+
+checkpoint = (
+    Path(os.environ["nnUNet_results"])
+    / "Dataset501_DukeNFL"
+    / "nnUNetTrainer_250epochs__nnUNetPlans__2d"
+    / "fold_0"
+    / "checkpoint_best.pth"
+)
+
+require(version("nnunetv2") == "2.8.1", "nnU-Net version changed.")
+require(torch.__version__ == "2.5.1+cu121", "PyTorch version changed.")
+require(
+    checkpoint.is_file() and checkpoint.stat().st_size > 0,
+    "Best checkpoint missing or empty.",
+)
+
+with (pilot_root / "pilot_export_manifest.csv").open() as handle:
+    rows = list(csv.DictReader(handle))
+
+expected_ids = {row["case_id"] for row in rows}
+
+require(
+    len(rows) == len(expected_ids) == 20,
+    "Expected 20 unique pilot cases.",
+)
+
+actual_names = {path.name for path in images.glob("*.png")}
+expected_names = {f"{case_id}_0000.png" for case_id in expected_ids}
+
+require(
+    actual_names == expected_names,
+    "Pilot image folder differs from the export manifest.",
+)
+
+input_hashes = {}
+
+for row in rows:
+    path = images / f'{row["case_id"]}_0000.png'
+
+    with Image.open(path) as image:
+        image.load()
+        require(image.mode == "L", f"Expected grayscale L: {path.name}")
+        require(
+            image.size == (int(row["width"]), int(row["height"])),
+            f"Image dimensions changed: {path.name}",
+        )
+
+        array = np.asarray(image)
+        require(array.dtype == np.uint8, f"Expected uint8: {path.name}")
+        require(array.min() < array.max(), f"Constant image: {path.name}")
+
+    input_hashes[row["case_id"]] = file_sha256(path)
+
+# Ensure target inference uses the same model as the completed Duke test.
+checkpoint_hash = file_sha256(checkpoint)
+test_record = json.loads(
+    (
+        root
+        / "outputs/test_predictions/26427.rachel/evaluation_record.json"
+    ).read_text()
+)
+
+require(
+    checkpoint_hash == test_record["checkpoint_sha256"],
+    "Checkpoint differs from the model used for held-out testing.",
+)
+
+require(torch.cuda.is_available(), "CUDA unavailable.")
+require(torch.cuda.device_count() == 1, "Expected one visible GPU.")
+
+free, total = torch.cuda.mem_get_info(0)
+print("GPU:", torch.cuda.get_device_name(0))
+print(f"Free VRAM: {free / 1024**3:.2f} / {total / 1024**3:.2f} GiB")
+
+# Operational headroom check, not a measured peak-memory requirement.
+require(
+    free >= 6 * 1024**3,
+    "Less than 6 GiB free GPU memory; stopping before inference.",
+)
+
+require(
+    not output.exists() or not any(output.iterdir()),
+    "This job's output folder is populated; refusing to overwrite.",
+)
+output.mkdir(parents=True, exist_ok=True)
+
+record = {
+    "checkpoint": str(checkpoint),
+    "checkpoint_sha256": checkpoint_hash,
+    "fold": 0,
+    "case_ids": sorted(expected_ids),
+    "input_sha256": input_hashes,
+    "input_folder": str(images),
+    "nnunet_version": version("nnunetv2"),
+    "torch_version": torch.__version__,
+    "ground_truth_available": False,
+}
+
+(output / "pilot_record.json").write_text(
+    json.dumps(record, indent=2) + "\n"
+)
+
+print("Preflight passed: 20 target scans; frozen checkpoint verified.")
+print("Output:", output)
+PY
+
+nnUNetv2_predict \
+    -i "$PWD/outputs/target_edge_probe/images" \
+    -o "$OCT_PILOT_OUTPUT" \
+    -d 501 \
+    -c 2d \
+    -f 0 \
+    -tr nnUNetTrainer_250epochs \
+    -p nnUNetPlans \
+    -chk checkpoint_best.pth \
+    -device cuda \
+    -npp 2 \
+    -nps 2 \
+    --not_on_device \
+    --save_probabilities \
+    --disable_progress_bar
+
+python - <<'PY'
+import json
+import os
+from pathlib import Path
+
+import numpy as np
+from PIL import Image
+
+output = Path(os.environ["OCT_PILOT_OUTPUT"])
+record = json.loads((output / "pilot_record.json").read_text())
+
+expected = set(record["case_ids"])
+images = Path(record["input_folder"])
+
+if {p.stem for p in output.glob("*.png")} != expected:
+    raise RuntimeError("Missing or unexpected predicted masks.")
+
+if {p.stem for p in output.glob("*.npz")} != expected:
+    raise RuntimeError("Missing or unexpected probability files.")
+
+for case_id in sorted(expected):
+    with Image.open(images / f"{case_id}_0000.png") as image:
+        expected_shape = (image.height, image.width)
+
+    with Image.open(output / f"{case_id}.png") as image:
+        prediction = np.asarray(image)
+
+    if prediction.shape != expected_shape:
+        raise RuntimeError(f"Prediction dimensions changed: {case_id}")
+
+    if not set(np.unique(prediction)).issubset({0, 1}):
+        raise RuntimeError(f"Unexpected labels: {case_id}")
+
+print("Verified all 20 masks at their original image dimensions.")
+print("SUCCESS: target pilot inference completed.")
+print("Predictions:", output)
+PY
