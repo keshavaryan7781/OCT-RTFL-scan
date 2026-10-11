@@ -222,7 +222,7 @@ nnUNetv2_predict \
     --not_on_device \
     --save_probabilities \
     --disable_progress_bar
-    
+
 # Confirm that every requested case produced a readable mask.
 python - <<'PY'
 import json
