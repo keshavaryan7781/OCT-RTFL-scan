@@ -1,0 +1,74 @@
+#!/bin/bash
+#PBS -N oct-sam-pilot
+#PBS -q gpu
+#PBS -l select=1:ncpus=6:ngpus=1:mem=16gb
+#PBS -l place=scatter:shared
+#PBS -l walltime=00:30:00
+#PBS -j oe
+
+set -Ee -o pipefail
+: "${PBS_JOBID:?Submit with qsub}"
+
+cd "$HOME/OCT-RTFL"
+mkdir -p outputs/logs
+
+exec >> "outputs/logs/sam_pilot_${PBS_JOBID}.log" 2>&1
+
+on_exit() {
+    rc=$?
+    trap - EXIT
+    echo "Exit status: $rc"
+    date
+    exit "$rc"
+}
+trap on_exit EXIT
+
+date
+hostname
+
+# Coordinate with your existing cooperating prediction/training jobs.
+command -v flock >/dev/null
+exec 9> outputs/logs/Dataset501_fold0.lock
+if ! flock -n 9; then
+    echo "Another cooperating project job holds the lock."
+    exit 1
+fi
+
+# Preserve scheduler mask; reuse the existing Rachel fallback if absent.
+if [ "${CUDA_VISIBLE_DEVICES+x}" = x ]; then
+    if [ -z "$CUDA_VISIBLE_DEVICES" ]; then
+        echo "Incoming GPU mask is explicitly empty; stopping."
+        exit 1
+    fi
+    echo "GPU selection: incoming CUDA_VISIBLE_DEVICES."
+else
+    if [ "$(hostname -s)" != rachel-gpu ] ||
+       [ -n "${PBS_GPUFILE:-}" ]; then
+        echo "Unrecognized GPU assignment; stopping."
+        exit 1
+    fi
+
+    gpu_uuid="$(
+        nvidia-smi -i 1 --query-gpu=uuid --format=csv,noheader
+    )"
+
+    if [[ ! "$gpu_uuid" =~ ^GPU-[[:xdigit:]-]+$ ]]; then
+        echo "Could not identify physical GPU 1."
+        exit 1
+    fi
+
+    export CUDA_VISIBLE_DEVICES="$gpu_uuid"
+    echo "GPU selection: existing Rachel fallback, physical GPU 1."
+fi
+
+echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+nvidia-smi
+
+export OMP_NUM_THREADS=2
+export MKL_NUM_THREADS=2
+export OPENBLAS_NUM_THREADS=2
+export PYTHONUNBUFFERED=1
+export MPLBACKEND=Agg
+
+"$HOME/miniconda3/envs/oct_sam/bin/python" \
+    src/run_sam_prompt_pilot.py
